@@ -32,7 +32,9 @@ class RecordingSession {
 
   private var initialTimestamp: CMTime?
   private var latestTimestamp: CMTime?
+  private var hasStartedWritingSession = false
   private var hasWrittenFirstVideoFrame = false
+  private var isFinishing = false
 
   var url: URL {
     return assetWriter.outputURL
@@ -110,7 +112,7 @@ class RecordingSession {
   /**
    Start the Asset Writer(s). If the AssetWriter failed to start, an error will be thrown.
    */
-  func start() throws {
+  func startAssetWriter() throws {
     ReactLogger.log(level: .info, message: "Starting Asset Writer(s)...")
 
     let success = assetWriter.startWriting()
@@ -118,10 +120,6 @@ class RecordingSession {
       ReactLogger.log(level: .error, message: "Failed to start Asset Writer(s)!")
       throw RecordingSessionError.failedToStartSession
     }
-
-    initialTimestamp = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 1_000_000_000)
-    assetWriter.startSession(atSourceTime: initialTimestamp!)
-    ReactLogger.log(level: .info, message: "Started RecordingSession at \(initialTimestamp!.seconds) seconds.")
   }
 
   /**
@@ -135,11 +133,6 @@ class RecordingSession {
     }
     if !CMSampleBufferDataIsReady(buffer) {
       ReactLogger.log(level: .error, message: "Frame arrived, but sample buffer is not ready!")
-      return
-    }
-    guard let initialTimestamp = initialTimestamp else {
-      ReactLogger.log(level: .error,
-                      message: "A frame arrived, but initialTimestamp was nil. Is this RecordingSession running?")
       return
     }
 
@@ -160,10 +153,15 @@ class RecordingSession {
         ReactLogger.log(level: .error, message: "Failed to get the CVImageBuffer!")
         return
       }
+      // Start the writing session before we write the first video frame
+      if !hasStartedWritingSession {
+        assetWriter.startSession(atSourceTime: timestamp)
+        ReactLogger.log(level: .info, message: "Started RecordingSession at \(timestamp.seconds) seconds.")
+        hasStartedWritingSession = true
+      }
       bufferAdaptor.append(imageBuffer, withPresentationTime: timestamp)
       if !hasWrittenFirstVideoFrame {
         hasWrittenFirstVideoFrame = true
-        ReactLogger.log(level: .warning, message: "VideoWriter: First frame arrived \((initialTimestamp - timestamp).seconds) seconds late.")
       }
     case .audio:
       guard let audioWriter = audioWriter else {
@@ -173,7 +171,7 @@ class RecordingSession {
       if !audioWriter.isReadyForMoreMediaData {
         return
       }
-      if !hasWrittenFirstVideoFrame {
+      if !hasWrittenFirstVideoFrame || !hasStartedWritingSession {
         // first video frame has not been written yet, so skip this audio frame.
         return
       }
@@ -193,15 +191,22 @@ class RecordingSession {
   func finish() {
     ReactLogger.log(level: .info, message: "Finishing Recording with AssetWriter status \"\(assetWriter.status.descriptor)\"...")
 
+    if isFinishing {
+      ReactLogger.log(level: .warning, message: "Tried calling finish() twice while AssetWriter is still writing!")
+      return
+    }
+
     if !hasWrittenFirstVideoFrame {
       let error = NSError(domain: "capture/aborted",
                           code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Stopped Recording Session too early, no frames have been recorded!"])
       completionHandler(self, .failed, error)
     } else if assetWriter.status == .writing {
+      isFinishing = true
+      bufferAdaptor?.assetWriterInput.markAsFinished()
+      audioWriter?.markAsFinished()
       assetWriter.finishWriting {
-        self.bufferAdaptor?.assetWriterInput.markAsFinished()
-        self.audioWriter?.markAsFinished()
+        self.isFinishing = false
         self.completionHandler(self, self.assetWriter.status, self.assetWriter.error)
       }
     } else {
